@@ -53,6 +53,8 @@ class UNet2DModel(L.LightningModule):
         self.mid_block = None
         self.up_blocks = nn.ModuleList([])
 
+        self.loss_fn = nn.MSELoss()
+
         output_channel = block_out_channels[0]
         for i, down_block_type in enumerate(down_block_types):
             input_channel = output_channel
@@ -114,12 +116,11 @@ class UNet2DModel(L.LightningModule):
     def forward(
             self,
             sample: torch.Tensor,
-            timestep: Union[torch.Tensor, float, int], ) -> UNet2DOutput:
+            timesteps: Union[torch.Tensor, float, int], ) -> UNet2DOutput:
 
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
+        if not isinstance(timesteps, torch.Tensor):
             timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+        elif isinstance(timesteps, torch.Tensor) and len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
 
         timesteps = timesteps * torch.ones(sample.shape[0], dtype=timesteps.dtype, device=timesteps.device)
@@ -167,7 +168,7 @@ class UNet2DModel(L.LightningModule):
         return UNet2DOutput(sample=sample)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-4)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3)
         lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=500,
@@ -182,10 +183,6 @@ class UNet2DModel(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": lr_scheduler_config,
         }
-
-    @staticmethod
-    def loss_fn(x0, x_t):
-        return torch.nn.functional.mse_loss(x_t, x0, reduction='mean')
 
     @property
     def noise_scheduler(self):
@@ -205,7 +202,7 @@ class UNet2DModel(L.LightningModule):
 
         # Forward pass
         noise_pred = self.forward(noisy_images, timesteps, ).sample
-        loss = self.loss_fn(clean_images, noise_pred)
+        loss = self.loss_fn(noise_pred, clean_images)
         self.log("train_loss", loss, prog_bar=True)
         return {"loss": loss}
 
@@ -221,6 +218,6 @@ class UNet2DModel(L.LightningModule):
 
         # Forward pass
         noise_pred = self.forward(noisy_images, timesteps, ).sample
-        loss = self.loss_fn(clean_images, noise_pred)
+        loss = self.loss_fn(noise_pred, clean_images)
         self.log("val_loss", loss, prog_bar=True)
         return {"loss": loss}
