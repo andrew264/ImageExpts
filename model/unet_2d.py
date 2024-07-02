@@ -125,7 +125,7 @@ class UNet2DModel(L.LightningModule):
 
         timesteps = timesteps * torch.ones(sample.shape[0], dtype=timesteps.dtype, device=timesteps.device)
 
-        t_emb = self.time_proj(timesteps).to(dtype=self.dtype)
+        t_emb = self.time_proj(timesteps).to(dtype=sample.dtype)
         emb = self.time_embedding(t_emb)
 
         skip_sample = sample

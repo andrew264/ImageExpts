@@ -2,7 +2,7 @@ from typing import Optional, Union, Tuple
 
 
 class UNet2DConfig:
-    sample_size: Optional[Union[int, Tuple[int, int]]] = None,
+    sample_size: Optional[Union[int, Tuple[int, int]]] = 128
     in_channels: int = 3
     out_channels: int = 3
     down_block_types: Tuple[str, ...] = (

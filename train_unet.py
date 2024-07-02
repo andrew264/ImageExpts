@@ -9,7 +9,7 @@ from torchvision import transforms
 from model import UNet2DConfig, UNet2DModel
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-dtype = torch.float32
+dtype = torch.bfloat16
 torch.set_float32_matmul_precision('high')
 
 
@@ -26,11 +26,6 @@ def train(model, dataloader):
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
     cfg = UNet2DConfig()
-    cfg.sample_size = 96
-    cfg.down_block_types = ("DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D")
-    cfg.up_block_types = ("AttnUpBlock2D", "AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D")
-    cfg.block_out_channels = (128, 256, 384, 512)
-    cfg.layers_per_block = 2
     model = UNet2DModel(config=cfg).to(device=device, dtype=dtype)
     print(model)
     print(f"Model has {count_parameters(model):,} trainable parameters.")
