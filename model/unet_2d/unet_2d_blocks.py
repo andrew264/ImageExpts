@@ -3,8 +3,8 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from .attention import Attention
-from .resnet_2d import ResnetBlock2D
+from ..attention import Attention
+from ..resnet_2d import ResnetBlock2D
 
 
 def get_down_block(

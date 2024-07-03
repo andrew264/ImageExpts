@@ -6,9 +6,9 @@ import torch
 from diffusers import DDPMScheduler, get_cosine_schedule_with_warmup
 from torch import nn
 
-from .config import UNet2DConfig
-from .embedding import Timesteps, TimestepEmbedding
 from .unet_2d_blocks import get_down_block, UNetMidBlock2D, get_up_block
+from ..config import UNet2DConfig
+from ..embedding import Timesteps, TimestepEmbedding
 
 
 @dataclass
