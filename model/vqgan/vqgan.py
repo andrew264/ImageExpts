@@ -23,7 +23,7 @@ dd_config = MappingProxyType(dict(
 loss_config = MappingProxyType(dict(
     disc_conditional=False,
     disc_in_channels=3,
-    disc_start=100001,
+    disc_start=10000,
     disc_weight=0.8,
     codebook_weight=1.0,
 ))
@@ -48,12 +48,13 @@ class VQModel(L.LightningModule):
                                         remap=remap, sane_index_shape=sane_index_shape)
         self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
-
-        self.image_key = "image"
+        self.learning_rate = 2e-4
         if colorize_nlabels is not None:
             self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
         self.monitor = monitor
         self.loss = VQLPIPSWithDiscriminator(**lossconfig) if lossconfig is not None else None
+
+        self.automatic_optimization = False
 
     def encode(self, x):
         h = self.encoder(x)
@@ -75,36 +76,44 @@ class VQModel(L.LightningModule):
         return dec, diff
 
     @staticmethod
-    def get_input(batch, k):
-        x: torch.Tensor = batch[k]
-        if len(x.shape) == 3:
-            x = x[..., None]
-        x = x.permute(0, 3, 1, 2).contiguous()
-        return x.float()
+    def get_input(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
+        return x.contiguous().float()
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
-        x = self.get_input(batch, self.image_key)
+    def training_step(self, batch, batch_idx):
+        x = self.get_input(batch)
         xrec, qloss = self(x)
 
-        if optimizer_idx == 0:
-            # autoencoder
-            aeloss, log_dict_ae = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
+        opt_ae, opt_disc = self.optimizers()
+
+        ######################
+        # Optimize Generator #
+        ######################
+        aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step,
+                                        last_layer=self.get_last_layer(), split="train")
+        opt_ae.zero_grad()
+        self.manual_backward(aeloss)
+        opt_ae.step()
+
+        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
+
+        ##########################
+        # Optimize Discriminator #
+        ##########################
+        discloss, log_dict_disc = self.loss(qloss, x, xrec, 1, self.global_step,
                                             last_layer=self.get_last_layer(), split="train")
 
-            self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
-            return aeloss
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        opt_disc.step()
 
-        if optimizer_idx == 1:
-            # discriminator
-            discloss, log_dict_disc = self.loss(qloss, x, xrec, optimizer_idx, self.global_step,
-                                                last_layer=self.get_last_layer(), split="train")
-            self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
-            return discloss
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
 
     def validation_step(self, batch, batch_idx):
-        x = self.get_input(batch, self.image_key)
+        x = self.get_input(batch)
         xrec, qloss = self(x)
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step,
                                         last_layer=self.get_last_layer(), split="val")
@@ -137,7 +146,7 @@ class VQModel(L.LightningModule):
 
     def log_images(self, batch, **kwargs):
         log = dict()
-        x = self.get_input(batch, self.image_key).to(self.device)
+        x = self.get_input(batch).to(self.device)
         xrec, _ = self(x)
         if x.shape[1] > 3:
             x = self.to_rgb(x)

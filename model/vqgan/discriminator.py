@@ -119,6 +119,9 @@ class VQLPIPSWithDiscriminator(nn.Module):
                 global_step, last_layer=None, cond=None, split="train"):
         rec_loss = torch.abs(inputs.contiguous() - reconstructions.contiguous())
         if self.perceptual_weight > 0:
+            # clamp tensors to 0-1
+            inputs = torch.clamp(inputs, 0.0, 1.0)
+            reconstructions = torch.clamp(reconstructions, 0.0, 1.0)
             p_loss = self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
             rec_loss = rec_loss + self.perceptual_weight * p_loss
         else:
