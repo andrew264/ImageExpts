@@ -8,12 +8,16 @@ from torchvision import transforms
 
 from model import VQModel
 
+torch.set_float32_matmul_precision('high')
+
 
 def train(model: L.LightningModule, dataloader: DataLoader):
     trainer = L.Trainer(max_epochs=1)
     trainer.fit(model, dataloader)
     sd = model.state_dict()
-    sd.pop('loss')
+    for key in list(sd.keys()):
+        if key.startswith('loss'):
+            sd.pop(key)
     torch.save(sd, "weights/vqgan.pth")
 
 
