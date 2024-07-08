@@ -68,14 +68,15 @@ class VectorQuantizer(nn.Module):
 
         # reshape z -> (batch, height, width, channel) and flatten
         z = rearrange(z, 'b c h w -> b h w c').contiguous()
-        z_flattened = z.view(-1, self.e_dim)
+        bz = z.shape[0]
+        z_flattened = z.view(bz, -1, self.e_dim)
 
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
-        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
+        d = torch.sum(z_flattened ** 2, dim=-1, keepdim=True) + \
             torch.sum(self.embedding.weight ** 2, dim=1) - \
-            2 * torch.einsum('bd,dn->bn', z_flattened, self.embedding.weight.t())
+            2 * torch.einsum('zbd,dn->zbn', z_flattened, self.embedding.weight.t())
 
-        min_encoding_indices = torch.argmin(d, dim=1)
+        min_encoding_indices = torch.argmin(d, dim=-1)
         z_q = self.embedding(min_encoding_indices).view(z.shape)
 
         # compute loss for embedding
