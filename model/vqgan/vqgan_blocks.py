@@ -54,18 +54,8 @@ class ResnetBlock(nn.Module):
         self.conv2 = nn.Conv2d(self.out_channels, self.out_channels, kernel_size=3, padding=1)
 
         if self.in_channels != self.out_channels:
-            if self.use_conv_shortcut:
-                self.conv_shortcut = torch.nn.Conv2d(in_channels,
-                                                     out_channels,
-                                                     kernel_size=3,
-                                                     stride=1,
-                                                     padding=1)
-            else:
-                self.nin_shortcut = torch.nn.Conv2d(in_channels,
-                                                    out_channels,
-                                                    kernel_size=1,
-                                                    stride=1,
-                                                    padding=0)
+            if self.use_conv_shortcut: self.conv_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            else: self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x: torch.Tensor, temb: torch.Tensor = None) -> torch.Tensor:
         h = self.conv1(F.silu(self.norm1(x)))
@@ -76,10 +66,8 @@ class ResnetBlock(nn.Module):
         h = self.conv2(self.dropout(F.silu(self.norm2(h))))
 
         if self.in_channels != self.out_channels:
-            if self.use_conv_shortcut:
-                x = self.conv_shortcut(x)
-            else:
-                x = self.nin_shortcut(x)
+            if self.use_conv_shortcut: x = self.conv_shortcut(x)
+            else: x = self.nin_shortcut(x)
 
         return x + h
 
@@ -107,13 +95,12 @@ class Encoder(nn.Module):
             attn = nn.ModuleList()
             block_in = ch * in_ch_mult[i_level]
             block_out = ch * ch_mult[i_level]
-            for i_block in range(self.num_res_blocks):
+            for _ in range(self.num_res_blocks):
                 block.append(ResnetBlock(in_channels=block_in,
                                          out_channels=block_out,
                                          temb_channels=self.temb_ch))
                 block_in = block_out
-                if curr_res in attn_resolutions:
-                    attn.append(AttnBlock(block_in))
+                if curr_res in attn_resolutions: attn.append(AttnBlock(block_in))
             down = nn.Module()
             down.block = block
             down.attn = attn
@@ -124,19 +111,13 @@ class Encoder(nn.Module):
 
         # middle
         self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in,
-                                       out_channels=block_in,
-                                       temb_channels=self.temb_ch)
+        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in, temb_channels=self.temb_ch)
         self.mid.attn_1 = AttnBlock(block_in)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in,
-                                       out_channels=block_in,
-                                       temb_channels=self.temb_ch)
+        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in, temb_channels=self.temb_ch)
 
         # end
         self.norm_out = nn.GroupNorm(num_groups=32, num_channels=block_in, eps=1e-6, affine=True)
-        self.conv_out = nn.Conv2d(block_in,
-                                  2 * z_channels if double_z else z_channels,
-                                  kernel_size=3, padding=1)
+        self.conv_out = nn.Conv2d(block_in, 2 * z_channels if double_z else z_channels, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         temb = None
@@ -155,14 +136,10 @@ class Encoder(nn.Module):
                 hs.append(h)
 
         # middle
-        h = self.mid.block_1(h, temb)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h, temb)), temb)
 
         # end
-        h = self.norm_out(h)
-        h = F.silu(h)
-        h = self.conv_out(h)
+        h = self.conv_out(F.silu(self.norm_out(h)))
         return h
 
 
@@ -203,11 +180,10 @@ class Decoder(nn.Module):
             block = nn.ModuleList()
             attn = nn.ModuleList()
             block_out = ch * ch_mult[i_level]
-            for i_block in range(self.num_res_blocks + 1):
+            for _ in range(self.num_res_blocks + 1):
                 block.append(ResnetBlock(in_channels=block_in, out_channels=block_out, temb_channels=self.temb_ch))
                 block_in = block_out
-                if curr_res in attn_resolutions:
-                    attn.append(AttnBlock(block_in))
+                if curr_res in attn_resolutions: attn.append(AttnBlock(block_in))
             up = nn.Module()
             up.block = block
             up.attn = attn
@@ -225,7 +201,6 @@ class Decoder(nn.Module):
         temb = None
 
         h = self.conv_in(z)
-
         h = self.mid.block_1(h, temb)
         h = self.mid.attn_1(h)
         h = self.mid.block_2(h, temb)
@@ -235,12 +210,9 @@ class Decoder(nn.Module):
                 h = self.up[i_level].block[i_block](h, temb)
                 if self.up[i_level].attn:
                     h = self.up[i_level].attn[i_block](h)
-            if i_level != 0:
-                h = self.up[i_level].upsample(h)
+            if i_level != 0: h = self.up[i_level].upsample(h)
 
-        if self.give_pre_end:
-            return h
-
+        if self.give_pre_end: return h
         return self.conv_out(F.silu(self.norm_out(h)))
 
 
@@ -248,13 +220,11 @@ class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv):
         super().__init__()
         self.with_conv = with_conv
-        if self.with_conv:
-            self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        if self.with_conv: self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2.0, mode="nearest")
-        if self.with_conv:
-            x = self.conv(x)
+        if self.with_conv: x = self.conv(x)
         return x
 
 
@@ -262,13 +232,9 @@ class Downsample(nn.Module):
     def __init__(self, in_channels, with_conv):
         super().__init__()
         self.with_conv = with_conv
-        if self.with_conv:
-            self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
+        if self.with_conv: self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.with_conv:
-            x = F.pad(x, (0, 1, 0, 1), mode="constant", value=0)
-            x = self.conv(x)
-        else:
-            x = F.avg_pool2d(x, kernel_size=2, stride=2)
+        if self.with_conv: x = self.conv(F.pad(x, (0, 1, 0, 1), mode="constant", value=0))
+        else: x = F.avg_pool2d(x, kernel_size=2, stride=2)
         return x
