@@ -13,6 +13,7 @@ class ImageTokenizer:
     # https://github.com/facebookresearch/chameleon/blob/main/chameleon/inference/image_tokenizer.py
     def __init__(self, model: VQModel = None, device: str | torch.device | None = None,):
         self._vq_model = model
+        self._dtype = None
 
         if self._vq_model is not None:
             if device is None:
@@ -32,7 +33,7 @@ class ImageTokenizer:
             transforms.Resize(target_image_size, transforms.InterpolationMode.LANCZOS),
             transforms.PILToTensor(),
             transforms.CenterCrop(target_image_size),
-            transforms.ToDtype(torch.float32, scale=True),
+            transforms.ToDtype(self._dtype if self._dtype else torch.float32, scale=True),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
 
@@ -64,7 +65,8 @@ class ImageTokenizer:
     def pil_from_img_toks(self, img_tensor: Tensor) -> List[Image.Image]:
         emb_dim = self._vq_model.quantize.embedding.weight.shape[-1]
         if img_tensor.ndim == 3: img_tensor = img_tensor.unsqueeze(0)
-        bz = img_tensor.shape[0]
-        codebook_entry = self._vq_model.quantize.get_codebook_entry(img_tensor, (bz, 32, 32, emb_dim))
+        bz, num_tokens = img_tensor.size()
+        out_size = int(num_tokens ** 0.5)
+        codebook_entry = self._vq_model.quantize.get_codebook_entry(img_tensor, (bz, out_size, out_size, emb_dim))
         pixels = self._vq_model.decode(codebook_entry)
         return self._pil_from_chw_tensor(pixels)

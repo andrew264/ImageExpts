@@ -31,19 +31,20 @@ loss_config = MappingProxyType(dict(
 
 class VQModel(L.LightningModule):
     # https://github.com/CompVis/taming-transformers/blob/master/taming/models/vqgan.py
-    def __init__(self, ddconfig=dd_config,  lossconfig: Optional[dict] = None, n_embed: int=8192, embed_dim: int=256, colorize_nlabels=None, monitor=None, remap=None, sane_index_shape=False,):
+    def __init__(self, ddconfig=dd_config,  lossconfig: Optional[dict] = None, n_embed: int=8192, embed_dim: int=256, colorize_nlabels=None, monitor=None, remap=None, sane_index_shape=False, grad_accum_steps: int=1):
         super().__init__()
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
         self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25, remap=remap, sane_index_shape=sane_index_shape)
         self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
-        self.learning_rate = 2e-4
+        self.learning_rate = 5e-4
         if colorize_nlabels is not None: self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
         self.monitor = monitor
         self.loss = VQLPIPSWithDiscriminator(**lossconfig) if lossconfig is not None else None
 
         self.automatic_optimization = False
+        self.grad_accum_steps = grad_accum_steps
 
     def encode(self, x): return self.quantize(self.quant_conv(self.encoder(x)))
 
@@ -60,8 +61,8 @@ class VQModel(L.LightningModule):
         if x.ndim == 3: x = x.unsqueeze(0)
         return x.contiguous()
 
-    def training_step(self, x, **kwargs):
-        x = self.get_input(x)
+    def training_step(self, batch, batch_idx):
+        x = self.get_input(batch)
         xrec, qloss = self(x)
 
         opt_ae, opt_disc = self.optimizers()
@@ -70,9 +71,11 @@ class VQModel(L.LightningModule):
         # Optimize Generator #
         ######################
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step, last_layer=self.get_last_layer(), split="train")
-        opt_ae.zero_grad()
-        self.manual_backward(aeloss)
-        opt_ae.step()
+        self.manual_backward(aeloss / self.grad_accum_steps)
+
+        if (batch_idx + 1) % self.grad_accum_steps == 0:
+            opt_ae.step()
+            opt_ae.zero_grad()
 
         self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=True)
@@ -81,10 +84,11 @@ class VQModel(L.LightningModule):
         # Optimize Discriminator #
         ##########################
         discloss, log_dict_disc = self.loss(qloss, x, xrec, 1, self.global_step, last_layer=self.get_last_layer(), split="train")
+        self.manual_backward(discloss / self.grad_accum_steps)
 
-        opt_disc.zero_grad()
-        self.manual_backward(discloss)
-        opt_disc.step()
+        if (batch_idx + 1) % self.grad_accum_steps == 0:
+            opt_disc.step()
+            opt_disc.zero_grad()
 
         self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=True)
@@ -104,28 +108,8 @@ class VQModel(L.LightningModule):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        opt_ae = torch.optim.Adam(list(self.encoder.parameters())+list(self.decoder.parameters())+list(self.quantize.parameters())+list(self.quant_conv.parameters())+list(self.post_quant_conv.parameters()), lr=lr, betas=(0.5, 0.9))
-        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9))
+        opt_ae = torch.optim.AdamW(list(self.encoder.parameters())+list(self.decoder.parameters())+list(self.quantize.parameters())+list(self.quant_conv.parameters())+list(self.post_quant_conv.parameters()), lr=lr, betas=(0.5, 0.9))
+        opt_disc = torch.optim.AdamW(self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9))
         return [opt_ae, opt_disc], []
 
-    def get_last_layer(self):
-        return self.decoder.conv_out.weight
-
-    def log_images(self, batch, **kwargs):
-        log = dict()
-        x = self.get_input(batch).to(self.device)
-        xrec, _ = self(x)
-        if x.shape[1] > 3:
-            x = self.to_rgb(x)
-            xrec = self.to_rgb(xrec)
-        log["inputs"] = x
-        log["reconstructions"] = xrec
-        return log
-
-    def to_rgb(self, x):
-        assert self.image_key == "segmentation"
-        if not hasattr(self, "colorize"):
-            self.register_buffer("colorize", torch.randn(3, x.shape[1], 1, 1).to(x))
-        x = F.conv2d(x, weight=self.colorize)
-        x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
-        return x
+    def get_last_layer(self): return self.decoder.conv_out.weight

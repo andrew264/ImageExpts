@@ -15,6 +15,11 @@ def hinge_d_loss(logits_real, logits_fake):
 def vanilla_d_loss(logits_real, logits_fake):
     return 0.5 * (torch.mean(F.softplus(-logits_real)) + torch.mean(F.softplus(logits_fake)))
 
+def hinge_g_loss(logits_fake): return -torch.mean(logits_fake)
+
+
+def vanilla_g_loss(logits_fake): return torch.mean(F.softplus(-logits_fake))
+
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -31,22 +36,13 @@ class NLayerDiscriminator(nn.Module):
     """
 
     def __init__(self, input_nc=3, ndf=64, n_layers=3, ):
-        """Construct a PatchGAN discriminator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            ndf (int)       -- the number of filters in the last conv layer
-            n_layers (int)  -- the number of conv layers in the discriminator
-        """
         super(NLayerDiscriminator, self).__init__()
         norm_layer = nn.BatchNorm2d
         use_bias = norm_layer != nn.BatchNorm2d
 
         kw = 4
         padw = 1
-        sequence = [
-            nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw),
-            nn.LeakyReLU(0.2, True)
-        ]
+        sequence = [nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw), nn.LeakyReLU(0.2, True)]
         nf_mult = 1
         nf_mult_prev = 1
         for n in range(1, n_layers):  # gradually increase the number of filters
@@ -66,8 +62,7 @@ class NLayerDiscriminator(nn.Module):
             nn.LeakyReLU(0.2, True)
         ]
 
-        sequence += [
-            nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]  # output 1 channel prediction map
+        sequence += [nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)]  # output 1 channel prediction map
         self.main = nn.Sequential(*sequence)
 
     def forward(self, x):
@@ -83,18 +78,17 @@ class VQLPIPSWithDiscriminator(nn.Module):
         assert disc_loss in ["hinge", "vanilla"]
         self.codebook_weight = codebook_weight
         self.pixel_weight = pixelloss_weight
-        self.perceptual_loss = LearnedPerceptualImagePatchSimilarity(normalize=True).eval()
+        self.perceptual_loss = LearnedPerceptualImagePatchSimilarity(net_type='vgg', reduction='mean', normalize=False).eval()
         self.perceptual_weight = perceptual_weight
 
-        self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels,
-                                                 n_layers=disc_num_layers,
-                                                 ndf=disc_ndf
-                                                 ).apply(weights_init)
+        self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels, n_layers=disc_num_layers, ndf=disc_ndf).apply(weights_init)
         self.discriminator_iter_start = disc_start
         if disc_loss == "hinge":
             self.disc_loss = hinge_d_loss
+            self.gen_loss = hinge_g_loss
         elif disc_loss == "vanilla":
             self.disc_loss = vanilla_d_loss
+            self.gen_loss = vanilla_g_loss
         else:
             raise ValueError(f"Unknown GAN loss '{disc_loss}'.")
         print(f"VQLPIPSWithDiscriminator running with {disc_loss} loss.")
@@ -115,20 +109,16 @@ class VQLPIPSWithDiscriminator(nn.Module):
         d_weight = d_weight * self.discriminator_weight
         return d_weight
 
-    def forward(self, codebook_loss, inputs, reconstructions, optimizer_idx,
-                global_step, last_layer=None, cond=None, split="train"):
+    def forward(self, codebook_loss, inputs, reconstructions, optimizer_idx, global_step, last_layer=None, cond=None, split="train"):
         rec_loss = torch.abs(inputs.contiguous() - reconstructions.contiguous())
         if self.perceptual_weight > 0:
-            # clamp tensors to 0-1
-            inputs = torch.clamp(inputs, 0.0, 1.0)
-            reconstructions = torch.clamp(reconstructions, 0.0, 1.0)
+            # clamp tensors to -1 to 1
+            reconstructions = torch.clamp(reconstructions, -1.0, 1.0)
             p_loss = self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
-            rec_loss = rec_loss + self.perceptual_weight * p_loss
         else:
             p_loss = torch.tensor([0.0])
 
-        nll_loss = rec_loss
-        # nll_loss = torch.sum(nll_loss) / nll_loss.shape[0]
+        nll_loss = rec_loss + self.perceptual_weight * p_loss
         nll_loss = torch.mean(nll_loss)
 
         # now the GAN part
@@ -140,7 +130,7 @@ class VQLPIPSWithDiscriminator(nn.Module):
             else:
                 assert self.disc_conditional
                 logits_fake = self.discriminator(torch.cat((reconstructions.contiguous(), cond), dim=1))
-            g_loss = -torch.mean(logits_fake)
+            g_loss = self.gen_loss(logits_fake)
 
             try:
                 d_weight = self.calculate_adaptive_weight(nll_loss, g_loss, last_layer=last_layer)
@@ -158,8 +148,7 @@ class VQLPIPSWithDiscriminator(nn.Module):
                    "{}/p_loss".format(split): p_loss.detach().mean(),
                    "{}/d_weight".format(split): d_weight.detach(),
                    "{}/disc_factor".format(split): torch.tensor(disc_factor),
-                   "{}/g_loss".format(split): g_loss.detach().mean(),
-                   }
+                   "{}/g_loss".format(split): g_loss.detach().mean(),}
             return loss, log
 
         if optimizer_idx == 1:
@@ -176,6 +165,5 @@ class VQLPIPSWithDiscriminator(nn.Module):
 
             log = {"{}/disc_loss".format(split): d_loss.clone().detach().mean(),
                    "{}/logits_real".format(split): logits_real.detach().mean(),
-                   "{}/logits_fake".format(split): logits_fake.detach().mean()
-                   }
+                   "{}/logits_fake".format(split): logits_fake.detach().mean()}
             return d_loss, log
