@@ -1,23 +1,47 @@
 import os
+import io
 
-import datasets
+import h5py
 import lightning as L
 import torch
+import numpy as np
 from PIL import Image
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from lightning.pytorch.callbacks import ModelCheckpoint
+import torchvision.transforms.v2 as transforms
 
 from model import VQModel
-from model.vqgan.image_tokenizer import ImageTokenizer
+from model.vqgan.image_tokenizer import TiledImageTokenizer
 
 torch.set_float32_matmul_precision('high')
 
+class HDF5ImageDataset(Dataset):
+    def __init__(self, file_path: str):
+        self.path = file_path
+        with h5py.File(self.path, 'r') as hf:
+            self.keys = list(hf.keys())
+
+        self.transform = transforms.Compose([transforms.ToDtype(torch.bfloat16, scale=True),
+                                             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+    
+    def __len__(self): return len(self.keys)
+    
+    def jpeg_bytes_to_tensor(self, jpeg_bytes: bytes) -> torch.Tensor:
+        img = Image.open(io.BytesIO(jpeg_bytes))
+        img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1)
+        return self.transform(img_tensor)
+    
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        with h5py.File(self.path, 'r') as hf:
+            jpeg_bytes: bytes = hf[self.keys[idx]][()]
+        return self.jpeg_bytes_to_tensor(jpeg_bytes)
+    
 class Debug(L.Callback):
     def __init__(self):
-        self.tokenizer: ImageTokenizer = None
+        self.tokenizer: TiledImageTokenizer = None
         self.image = Image.open('data/test.png')
     def setup(self, trainer, pl_module, stage):
-        self.tokenizer = ImageTokenizer(pl_module)
+        self.tokenizer = TiledImageTokenizer(pl_module)
     def on_train_batch_end(self, trainer: L.Trainer, pl_module, outputs, batch, batch_idx):
         step = batch_idx
         if step > 0 and step % 500 == 0:
@@ -37,21 +61,17 @@ def train(model: L.LightningModule, dataloader: DataLoader):
 
 
 if __name__ == '__main__':
-    dd_config = dict(double_z=False, z_channels=256, resolution=512, in_channels=3, out_ch=3, ch=128, ch_mult=[1, 1, 2, 2, 4], num_res_blocks=2, attn_resolutions=[],)
-    l_cfg = dict(disc_conditional=False, disc_in_channels=3, disc_start=100000, disc_weight=0.8, codebook_weight=1.0,)
-    model = VQModel(dd_config, n_embed=2**14, lossconfig=l_cfg, grad_accum_steps=4).bfloat16().cuda()
+    dd_config = dict(double_z=False, z_channels=256, resolution=64, in_channels=3, out_ch=3, ch=128, ch_mult=[1, 1, 2, 2, 4], num_res_blocks=2, attn_resolutions=[],)
+    loss_config = dict(disc_conditional=False, disc_in_channels=3, disc_start=100000, disc_weight=0.8, codebook_weight=1.0,)
+    model = VQModel(dd_config, lossconfig=loss_config, n_embed=2**13, grad_accum_steps=1).bfloat16().cuda()
     # model.forward = torch.compile(model=model.forward,)
     print(model)
 
-    path = "/home/andrew264/datasets/text-to-image-2M/"
-    files = [path + f for f in os.listdir(path)]
-    dataset = datasets.load_dataset("webdataset", data_files={"train": files}, split='train', streaming=True)
-    tokenizer = ImageTokenizer()
+    path = "./vid_images.h5"
+    dataset = HDF5ImageDataset(path)
 
-    def transform(examples): return tokenizer._vqgan_input_from([e["jpg"] for e in examples]).bfloat16()
-
-
-    dataloader = DataLoader(dataset, batch_size=1, num_workers=4, collate_fn=transform)
-    if os.path.exists('./weights/vqgan.pth'):
-        model.load_state_dict(torch.load('./weights/vqgan.pth', map_location='cuda', weights_only=True), strict=False)
+    dataloader = DataLoader(dataset, batch_size=16, num_workers=4, shuffle=True,)
+    if os.path.exists('./weights/vqgan.ckpt'):
+        model.load_state_dict(torch.load('./weights/vqgan.ckpt', map_location='cuda', weights_only=True)['state_dict'], strict=False)
+        print('loaded weights')
     train(model, dataloader)
