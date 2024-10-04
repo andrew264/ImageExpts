@@ -1,4 +1,4 @@
-from typing import List, Union, Optional
+from typing import Any, List, Tuple, Union, Optional
 
 import numpy as np
 import torch
@@ -9,6 +9,8 @@ from torch import Tensor
 
 from model import VQModel
 
+def exists(x: Optional[Any]) ->bool: return x is not None
+
 
 class ImageTokenizer:
     # https://github.com/facebookresearch/chameleon/blob/main/chameleon/inference/image_tokenizer.py
@@ -16,8 +18,8 @@ class ImageTokenizer:
         self._vq_model = model
         self._dtype = None
 
-        if self._vq_model is not None:
-            if device is None:
+        if exists(model):
+            if not exists(device):
                 devices = {p.device for p in self._vq_model.parameters()}
                 assert len(devices) == 1
                 device = devices.pop()
@@ -72,42 +74,45 @@ class ImageTokenizer:
         return self._pil_from_chw_tensor(pixels)
 
 class TiledImageTokenizer:
-    def __init__(self, model: Optional[VQModel] = None, max_height=512, multiple=64, tile_size=(64, 64), control_token: int=-1,
+    def __init__(self, model: Optional[VQModel] = None, max_height=512, tile_size=64, tile_separator: Optional[int]=None, row_separator: Optional[int]=None,
                  device: Optional[Union[str, torch.device]] = None):
         self._vq_model = model
         self._dtype = None
         self.max_h = max_height
-        self.multiple = multiple
-        self.tile_size = tile_size
-        self._tpi: Optional[int] = None
+        self.multiple = tile_size
+        self.tile_size = (tile_size, tile_size)
+        self._tokens_per_tile: Optional[int] = None
+        if exists(row_separator) and exists(tile_separator): assert row_separator != tile_separator, "row_separator can't be the same as tile_separator"
+        if not exists(row_separator): print('row_separator is not set; image tiles will be stacked vertically')
 
-        if model is not None:
+        if exists(model):
             device = self._setup_device(device)
             self._vq_model.to(device).eval()
             self._dtype = next(self._vq_model.parameters()).dtype
         
         self._device = device
 
-        self.control_token = torch.tensor([control_token], device=self._device)
+        self.tile_separator = tile_separator
+        self.row_separator = row_separator
         self.transform = transforms.Compose([
             transforms.ToDtype(self._dtype or torch.float32, scale=True),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
 
     def _setup_device(self, device: Optional[Union[str, torch.device]]) -> torch.device:
-        if device is None:
+        if not exists(device):
             devices = {p.device for p in self._vq_model.parameters()}
             assert len(devices) == 1, "Model parameters are on different devices!"
             return devices.pop()
         return torch.device(device)
 
     @property
-    def tokens_per_img(self) -> int:
-        if self._tpi is None:
+    def tokens_per_tile(self) -> int:
+        if not exists(self._tokens_per_tile):
             random_img = torch.rand((1, 3, *self.tile_size), dtype=self._dtype, device=self._device)
             _, _, [_, _, img_toks] = self._vq_model.encode(random_img)
-            self._tpi = img_toks.size(-1)
-        return self._tpi
+            self._tokens_per_tile = img_toks.size(-1)
+        return self._tokens_per_tile
 
     def _preprocess_image(self, img: Image.Image) -> tuple[Tensor, int]:
         if img.height > self.max_h:
@@ -135,16 +140,42 @@ class TiledImageTokenizer:
         for img in images:
             img_tensor, tiles_per_row = self._preprocess_image(img)
             _, _, [_, _, img_toks] = self._vq_model.encode(img_tensor)
-            tokens_per_row = tiles_per_row * img_toks.size(-1)
-            tokens_list.append(self._add_control_token(img_toks.flatten(), tokens_per_row))
+            tokens_list.append(self._add_separators(img_toks, tiles_per_row))
         return torch.stack(tokens_list)
+    
+    def _add_separators(self, tokens: Tensor, tiles_per_row: int) -> Tensor:
+        num_tiles, features_per_tile = tokens.shape
+        num_rows = (num_tiles + tiles_per_row - 1) // tiles_per_row
+        total_length = (num_tiles * features_per_tile
+                    + (num_tiles if exists(self.tile_separator) else 0)
+                    + (num_rows - 1 if exists(self.row_separator) else 0))
+        out = torch.empty(total_length, dtype=tokens.dtype, device=tokens.device)
+        idx = 0
+        for i in range(num_tiles):
+            out[idx:idx+features_per_tile] = tokens[i]
+            idx+=features_per_tile
+            if exists(self.tile_separator):
+                out[idx] = self.tile_separator
+                idx += 1
+            if exists(self.row_separator) and (i+1) % tiles_per_row == 0 and i < num_tiles -1:
+                out[idx] = self.row_separator
+                idx+=1
+        return out[:idx]
+    
+    def _remove_separators(self, tokens: Tensor) -> Tuple[Tensor, int]:
+        tiles_per_row = None
+        if exists(self.row_separator):
+            first_row_sep_idx = (tokens==self.row_separator).nonzero(as_tuple=True)[0]
+            if len(first_row_sep_idx)> 0:
+                first_row_sep_idx = first_row_sep_idx[0].item()
+                non_separator_count = sum((tokens[:first_row_sep_idx] != self.tile_separator) & (tokens[:first_row_sep_idx] != self.row_separator))
+                tiles_per_row = non_separator_count // self.tokens_per_tile
 
-    def _add_control_token(self, tokens: Tensor, tokens_per_row: int) -> Tensor:
-        return torch.cat([torch.cat([row, self.control_token]) for row in tokens.split(tokens_per_row)])
-
-    def _remove_control_token(self, tokens: Tensor) -> tuple[Tensor, int]:
-        control_idx = (tokens == self.control_token).nonzero(as_tuple=True)[0][0].item()
-        return tokens[tokens != self.control_token], control_idx
+        mask = torch.ones_like(tokens, dtype=torch.bool)
+        if exists(self.tile_separator): mask &= (tokens != self.tile_separator)
+        if exists(self.row_separator): mask &= (tokens != self.row_separator)
+        new_tokens = tokens[mask]
+        return new_tokens.reshape(-1, self.tokens_per_tile), tiles_per_row.item() if exists(tiles_per_row) else 1
 
     def stich_tiles(self, tiles: List[Image.Image], tiles_per_row: int) -> Image.Image:
         stitched_img = Image.new('RGB', (tiles_per_row * self.tile_size[0], len(tiles) // tiles_per_row * self.tile_size[1]))
@@ -159,9 +190,7 @@ class TiledImageTokenizer:
         emb_dim = self._vq_model.quantize.embedding.weight.shape[-1]
         img_list = []
         for img in img_tensor:
-            img, tpr = self._remove_control_token(img)
-            tiles_per_row = tpr // self.tokens_per_img
-            img = img.view(-1, self.tokens_per_img)
+            img, tiles_per_row = self._remove_separators(img)
             bz, num_tokens = img.size()
             out_size = int(num_tokens ** 0.5)
 
