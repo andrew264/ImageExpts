@@ -41,10 +41,10 @@ class Debug(L.Callback):
         self.tokenizer: TiledImageTokenizer = None
         self.image = Image.open('data/test.png')
     def setup(self, trainer, pl_module, stage):
-        self.tokenizer = TiledImageTokenizer(pl_module)
+        self.tokenizer = TiledImageTokenizer(pl_module, max_height=512, tile_size=128, row_separator=-1, tile_separator=-2)
     def on_train_batch_end(self, trainer: L.Trainer, pl_module, outputs, batch, batch_idx):
         step = batch_idx
-        if step > 0 and step % 500 == 0:
+        if step % 5000 == 0:
             tokens = self.tokenizer.img_tokens_from_pil(self.image)
             with open('data/tokens.txt', mode='a', encoding='utf-8') as f: f.write(f"step_{step}: " + str(tokens[0].tolist()) + '\n')
             img = self.tokenizer.pil_from_img_toks(tokens)[0]
@@ -61,8 +61,8 @@ def train(model: L.LightningModule, dataloader: DataLoader):
 
 
 if __name__ == '__main__':
-    dd_config = dict(double_z=False, z_channels=256, resolution=64, in_channels=3, out_ch=3, ch=128, ch_mult=[1, 1, 2, 2, 4], num_res_blocks=2, attn_resolutions=[],)
-    loss_config = dict(disc_conditional=False, disc_in_channels=3, disc_start=100000, disc_weight=0.8, codebook_weight=1.0,)
+    dd_config = dict(double_z=False, z_channels=256, resolution=128, in_channels=3, out_ch=3, ch=128, ch_mult=[1, 1, 2, 2, 4], num_res_blocks=2, attn_resolutions=[],)
+    loss_config = dict(disc_conditional=False, disc_in_channels=3, disc_start=100000000, disc_weight=0.8, codebook_weight=1.0,)
     model = VQModel(dd_config, lossconfig=loss_config, n_embed=2**13, grad_accum_steps=1).bfloat16().cuda()
     # model.forward = torch.compile(model=model.forward,)
     print(model)
@@ -71,7 +71,7 @@ if __name__ == '__main__':
     dataset = HDF5ImageDataset(path)
 
     dataloader = DataLoader(dataset, batch_size=16, num_workers=4, shuffle=True,)
-    if os.path.exists('./weights/vqgan.ckpt'):
-        model.load_state_dict(torch.load('./weights/vqgan.ckpt', map_location='cuda', weights_only=True)['state_dict'], strict=False)
-        print('loaded weights')
+    # if os.path.exists('./weights/vqgan.ckpt'):
+    #     model.load_state_dict(torch.load('./weights/vqgan.ckpt', map_location='cuda', weights_only=True)['state_dict'], strict=False)
+    #     print('loaded weights')
     train(model, dataloader)

@@ -31,11 +31,11 @@ loss_config = MappingProxyType(dict(
 
 class VQModel(L.LightningModule):
     # https://github.com/CompVis/taming-transformers/blob/master/taming/models/vqgan.py
-    def __init__(self, ddconfig=dd_config,  lossconfig: Optional[dict] = None, n_embed: int=8192, embed_dim: int=256, colorize_nlabels=None, monitor=None, remap=None, sane_index_shape=False, grad_accum_steps: int=1):
+    def __init__(self, ddconfig=dd_config,  lossconfig: Optional[dict] = None, n_embed: int=8192, embed_dim: int=256, colorize_nlabels=None, monitor=None, grad_accum_steps: int=1):
         super().__init__()
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
-        self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25, remap=remap, sane_index_shape=sane_index_shape)
+        self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
         self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         self.learning_rate = 5e-4
@@ -72,6 +72,7 @@ class VQModel(L.LightningModule):
         ######################
         aeloss, log_dict_ae = self.loss(qloss, x, xrec, 0, self.global_step, last_layer=self.get_last_layer(), split="train")
         self.manual_backward(aeloss / self.grad_accum_steps)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
         if (batch_idx + 1) % self.grad_accum_steps == 0:
             opt_ae.step()
