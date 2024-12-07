@@ -48,7 +48,7 @@ class VQModel(L.LightningModule):
 
     def encode(self, x): return self.quantize(self.quant_conv(self.encoder(x)))
 
-    def decode(self, quant):  return self.decoder(self.post_quant_conv(quant))
+    def decode(self, quant): return self.decoder(self.post_quant_conv(quant))
 
     def decode_code(self, code_b): return self.decode(self.quantize.embed_code(code_b))
 
