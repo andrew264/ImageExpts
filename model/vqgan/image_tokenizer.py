@@ -1,206 +1,239 @@
+import math
 from typing import Any, List, Tuple, Union, Optional
 
 import numpy as np
 import torch
 import torchvision.transforms.v2 as transforms
-from PIL import Image, ImageOps
-from PIL.Image import Resampling
+from PIL import Image
 from torch import Tensor
+from torch.nn import functional as F
 
 from model import VQModel
 
 def exists(x: Optional[Any]) ->bool: return x is not None
 
+# Helper function for padding dimensions
+def _pad_to_multiple(n, mult):
+    """Calculates the smallest multiple of `mult` greater than or equal to `n`."""
+    return math.ceil(n / mult) * mult
 
 class ImageTokenizer:
     # https://github.com/facebookresearch/chameleon/blob/main/chameleon/inference/image_tokenizer.py
-    def __init__(self, model: VQModel = None, resolution: int = 512, device: str | torch.device | None = None,):
+    def __init__(
+        self,
+        model: VQModel = None,
+        device: str | torch.device | None = None,
+        target_height: Optional[int] = None,
+        target_width: Optional[int] = None,
+    ):
         self._vq_model = model
         self._dtype = None
+        self._device = device
+        self.target_height = target_height
+        self.target_width = target_width
 
-        if exists(model):
-            if not exists(device):
+        if model is not None:
+            if not device:
                 devices = {p.device for p in self._vq_model.parameters()}
-                assert len(devices) == 1
-                device = devices.pop()
+                assert len(devices) == 1, "Model parameters must be on a single device"
+                self._device = devices.pop()
             else:
-                self._vq_model.to(device)
+                self._vq_model.to(self._device)
+
             self._vq_model.eval()
             dtypes = {p.dtype for p in self._vq_model.parameters()}
-            assert len(dtypes) == 1
+            assert len(dtypes) == 1, "Model parameters must have a single dtype"
             self._dtype = dtypes.pop()
-        self._device = device
 
-        self.transform = transforms.Compose([
-            transforms.Resize(resolution, transforms.InterpolationMode.LANCZOS),
-            transforms.PILToTensor(),
-            transforms.CenterCrop(resolution),
-            transforms.ToDtype(self._dtype if self._dtype else torch.float32, scale=True),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
+            if hasattr(model, 'encoder') and hasattr(model.encoder, 'ch_mult'):
+                num_downsamplings = len(model.encoder.ch_mult) - 1
+                self.downsample_factor = 2 ** num_downsamplings
+            else:
+                # Fallback or raise error if config structure changes
+                print("Warning: Could not determine downsample_factor from model config, assuming 16.")
+                self.downsample_factor = 16
+            # --- ---
+
+        else:
+            self.downsample_factor = 16
+            print("Warning: No VQModel provided, assuming downsample_factor=16 for padding.")
+
+
+        # Normalization remains the same
+        self.normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        self.to_tensor = transforms.PILToTensor()
+        self.to_dtype = transforms.ToDtype(self._dtype if self._dtype else torch.float32, scale=True)
+
 
     @staticmethod
     def _whiten_transparency(img: Image.Image) -> Image.Image:
         if img.mode == "RGB": return img
         vals_rgba = np.array(img)
-        if img.mode != "RGBA": return img.convert("RGB")
+        if img.mode != "RGBA":
+            return img.convert("RGB")
+
+        # Ensure RGBA before proceeding
+        if vals_rgba.shape[2] != 4:
+            return img.convert("RGB") # Or handle appropriately
 
         alpha = vals_rgba[:, :, 3:] / 255.0
         vals_rgb = (1 - alpha) * 255 + alpha * vals_rgba[:, :, :3]
         return Image.fromarray(np.uint8(vals_rgb), "RGB")
 
-    def _vqgan_input_from(self, imgs: List[Image.Image]) -> Tensor:
-        return torch.stack([self.transform(self._whiten_transparency(img)) for img in imgs], dim=0)
+    def _preprocess_image(self, img: Image.Image) -> Tuple[Tensor, Tuple[int, int]]:
+        """
+        Resizes, pads, and preprocesses a single image.
 
-    def img_tokens_from_pil(self, images: Union[Image.Image | List[Image.Image]]) -> Tensor:
+        Returns:
+            - Padded tensor ready for VQGAN.
+            - image size (h, w).
+        """
+        img = self._whiten_transparency(img)
+        w_orig, h_orig = img.size
+
+        # --- Determine target size before padding ---
+
+        if self.target_height and self.target_width:
+            # Resize to specific target dimensions
+            h_new, w_new = self.target_height, self.target_width
+        elif self.target_height or self.target_width:
+            # Scale longest side to target, preserve aspect ratio
+            scale_h = (self.target_height / h_orig) if self.target_height else 1.0
+            scale_w = (self.target_width / w_orig) if self.target_width else 1.0
+            scale = min(scale_h, scale_w) if self.target_height and self.target_width else max(scale_h, scale_w)
+            h_new = int(round(h_orig * scale))
+            w_new = int(round(w_orig * scale))
+        else:
+            # Use original size
+            h_new, w_new = h_orig, w_orig
+
+        # Ensure dimensions are at least the downsample factor
+        h_new = max(h_new, self.downsample_factor)
+        w_new = max(w_new, self.downsample_factor)
+
+        img_resized = img.resize((w_new, h_new), Image.Resampling.LANCZOS)
+        w_unpadded, h_unpadded = img_resized.size # size *before* padding
+
+        # --- Pad to multiple of downsample_factor ---
+        h_padded = _pad_to_multiple(h_unpadded, self.downsample_factor)
+        w_padded = _pad_to_multiple(w_unpadded, self.downsample_factor)
+
+        pad_top = (h_padded - h_unpadded) // 2
+        pad_bottom = h_padded - h_unpadded - pad_top
+        pad_left = (w_padded - w_unpadded) // 2
+        pad_right = w_padded - w_unpadded - pad_left
+
+        tensor_resized = self.to_tensor(img_resized) # Shape (C, H, W)
+
+        # Pad (using F.pad for tensors)
+        padding = (pad_left, pad_right, pad_top, pad_bottom)
+        padded_tensor = F.pad(tensor_resized, padding, mode='constant', value=0) # Pad with 0 before scaling/norm
+
+        # Apply dtype conversion and normalization
+        processed_tensor = self.normalize(self.to_dtype(padded_tensor))
+
+        return processed_tensor, (h_padded, w_padded)
+
+
+    @torch.no_grad()
+    def img_tokens_from_pil(
+        self,
+        images: Union[Image.Image | List[Image.Image]]
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Encodes PIL image(s) into discrete tokens and returns grid shape info.
+
+        Args:
+            images: A single PIL Image or a list of PIL Images.
+
+        Returns:
+            A tuple containing:
+            - img_toks (Tensor): Flattened image tokens (B, N).
+            - grid_size (Tensor): Token grid dimensions for each image (B, 2), where each row is [h_tokens, w_tokens].
+        """
+        if not self._vq_model:
+            raise ValueError("VQModel must be provided during initialization to tokenize images.")
         if not isinstance(images, list): images = [images]
-        vqgan_input = self._vqgan_input_from(images).to(self._device, dtype=self._dtype)
-        _, _, [_, _, img_toks] = self._vq_model.encode(vqgan_input)
-        return img_toks
 
-    @staticmethod
-    def _pil_from_chw_tensor(chw_tensor: Tensor) -> List[Image.Image]:
-        normalized_chw_tensor = torch.clamp(chw_tensor.detach().cpu(), -1.0, 1.0).add(1).div(2)
-        normalized_chw_tensor = (normalized_chw_tensor.permute(0, 2, 3, 1) * 255).to(torch.uint8)
-        return [Image.fromarray(img.numpy(), mode="RGB") for img in normalized_chw_tensor]
-
-    def pil_from_img_toks(self, img_tensor: Tensor) -> List[Image.Image]:
-        emb_dim = self._vq_model.quantize.embedding.weight.shape[-1]
-        if img_tensor.ndim == 3: img_tensor = img_tensor.unsqueeze(0)
-        bz, num_tokens = img_tensor.size()
-        out_size = int(num_tokens ** 0.5)
-        codebook_entry = self._vq_model.quantize.get_codebook_entry(img_tensor, (bz, out_size, out_size, emb_dim))
-        pixels = self._vq_model.decode(codebook_entry)
-        return self._pil_from_chw_tensor(pixels)
-
-class TiledImageTokenizer:
-    def __init__(self, model: Optional[VQModel] = None, max_height=512, tile_size=64, tile_separator: Optional[int]=None, row_separator: Optional[int]=None,
-                 device: Optional[Union[str, torch.device]] = None):
-        self._vq_model = model
-        self._dtype = None
-        self.max_h = max_height
-        self.multiple = tile_size
-        self.tile_size = (tile_size, tile_size)
-        self._tokens_per_tile: Optional[int] = None
-        if exists(row_separator) and exists(tile_separator): assert row_separator != tile_separator, "row_separator can't be the same as tile_separator"
-        if not exists(row_separator): print('row_separator is not set; image tiles will be stacked vertically')
-
-        if exists(model):
-            device = self._setup_device(device)
-            self._vq_model.to(device).eval()
-            self._dtype = next(self._vq_model.parameters()).dtype
-        
-        self._device = device
-
-        self.tile_separator = tile_separator
-        self.row_separator = row_separator
-        self.transform = transforms.Compose([
-            transforms.ToDtype(self._dtype or torch.float32, scale=True),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
-
-    def _setup_device(self, device: Optional[Union[str, torch.device]]) -> torch.device:
-        if not exists(device):
-            devices = {p.device for p in self._vq_model.parameters()}
-            assert len(devices) == 1, "Model parameters are on different devices!"
-            return devices.pop()
-        return torch.device(device)
-
-    @property
-    def tokens_per_tile(self) -> int:
-        if not exists(self._tokens_per_tile):
-            random_img = torch.rand((1, 3, *self.tile_size), dtype=self._dtype, device=self._device)
-            _, _, [_, _, img_toks] = self._vq_model.encode(random_img)
-            self._tokens_per_tile = img_toks.size(-1)
-        return self._tokens_per_tile
-
-    def _preprocess_image(self, img: Image.Image) -> tuple[Tensor, int]:
-        if img.height > self.max_h:
-            ratio = self.max_h / img.height
-            img = img.resize((int(img.width * ratio), self.max_h), resample=Resampling.LANCZOS)
-
-        new_dims = ((img.width + self.multiple - 1) // self.multiple * self.multiple,
-                    (img.height + self.multiple - 1) // self.multiple * self.multiple)
-        img = ImageOps.pad(img, new_dims, color=(0, 0, 0))
-
-        tiles = [self._process_tile(np.array(img.crop((j, i, j + self.tile_size[0], i + self.tile_size[1]))))
-                 for i in range(0, img.height, self.tile_size[1])
-                 for j in range(0, img.width, self.tile_size[0])]
-        return self.transform(torch.stack(tiles).permute(0, 3, 1, 2)).to(device=self._device), img.width // self.tile_size[0]
-
-    def _process_tile(self, tile: np.ndarray) -> Tensor:
-        if tile.shape[-1] == 4:
-            alpha = tile[:, :, 3:] / 255.0
-            tile = (1 - alpha) * 255 + alpha * tile[:, :, :3]
-        return torch.from_numpy(tile.astype(np.uint8))
-
-    def img_tokens_from_pil(self, images: Union[Image.Image, List[Image.Image]]) -> Tensor:
-        if not isinstance(images, list): images = [images]
-        tokens_list = []
+        processed_tensors = []
+        padded_sizes = []
         for img in images:
-            img_tensor, tiles_per_row = self._preprocess_image(img)
-            _, _, [_, _, img_toks] = self._vq_model.encode(img_tensor)
-            tokens_list.append(self._add_separators(img_toks, tiles_per_row))
-        return torch.stack(tokens_list)
-    
-    def _add_separators(self, tokens: Tensor, tiles_per_row: int) -> Tensor:
-        num_tiles, features_per_tile = tokens.shape
-        num_rows = (num_tiles + tiles_per_row - 1) // tiles_per_row
-        total_length = (num_tiles * features_per_tile
-                    + (num_tiles if exists(self.tile_separator) else 0)
-                    + (num_rows - 1 if exists(self.row_separator) else 0))
-        out = torch.empty(total_length, dtype=tokens.dtype, device=tokens.device)
-        idx = 0
-        for i in range(num_tiles):
-            out[idx:idx+features_per_tile] = tokens[i]
-            idx+=features_per_tile
-            if exists(self.tile_separator):
-                out[idx] = self.tile_separator
-                idx += 1
-            if exists(self.row_separator) and (i+1) % tiles_per_row == 0 and i < num_tiles -1:
-                out[idx] = self.row_separator
-                idx+=1
-        return out[:idx]
-    
-    def _remove_separators(self, tokens: Tensor) -> Tuple[Tensor, int]:
-        tiles_per_row = None
-        if exists(self.row_separator):
-            first_row_sep_idx = (tokens==self.row_separator).nonzero(as_tuple=True)[0]
-            if len(first_row_sep_idx)> 0:
-                first_row_sep_idx = first_row_sep_idx[0].item()
-                non_separator_count = sum((tokens[:first_row_sep_idx] != self.tile_separator) & (tokens[:first_row_sep_idx] != self.row_separator))
-                tiles_per_row = non_separator_count // self.tokens_per_tile
+            tensor, pad_size = self._preprocess_image(img)
+            processed_tensors.append(tensor)
+            padded_sizes.append(pad_size)
 
-        mask = torch.ones_like(tokens, dtype=torch.bool)
-        if exists(self.tile_separator): mask &= (tokens != self.tile_separator)
-        if exists(self.row_separator): mask &= (tokens != self.row_separator)
-        new_tokens = tokens[mask]
-        return new_tokens.reshape(-1, self.tokens_per_tile), tiles_per_row.item() if exists(tiles_per_row) else 1
+        vqgan_input = torch.stack(processed_tensors, dim=0).to(self._device, dtype=self._dtype)
 
-    def stich_tiles(self, tiles: List[Image.Image], tiles_per_row: int) -> Image.Image:
-        stitched_img = Image.new('RGB', (tiles_per_row * self.tile_size[0], len(tiles) // tiles_per_row * self.tile_size[1]))
-        for idx, tile in enumerate(tiles):
-            row, col = divmod(idx, tiles_per_row)
-            stitched_img.paste(tile, (col * self.tile_size[0], row * self.tile_size[1]))
-        return stitched_img
+        h = self._vq_model.quant_conv(self._vq_model.encoder(vqgan_input))
+        _, _, (_, _, img_toks_flat) = self._vq_model.quantize(h)
 
-    def pil_from_img_toks(self, img_tensor: Tensor) -> List[Image.Image]:
-        if img_tensor.ndim == 3: img_tensor = img_tensor.unsqueeze(0)
+        # Calculate grid sizes
+        grid_sizes_list = []
+        for h_pad, w_pad in padded_sizes:
+            h_tokens = h_pad // self.downsample_factor
+            w_tokens = w_pad // self.downsample_factor
+            grid_sizes_list.append([h_tokens, w_tokens])
 
-        emb_dim = self._vq_model.quantize.embedding.weight.shape[-1]
-        img_list = []
-        for img in img_tensor:
-            img, tiles_per_row = self._remove_separators(img)
-            bz, num_tokens = img.size()
-            out_size = int(num_tokens ** 0.5)
+        grid_size_tensor = torch.tensor(grid_sizes_list, dtype=torch.long, device=img_toks_flat.device)
 
-            codebook_entry = self._vq_model.quantize.get_codebook_entry(img, (bz, out_size, out_size, emb_dim))
-            pixels = self._vq_model.decode(codebook_entry)
-            img_list.append(self.stich_tiles(self._pil_from_chw_tensor(pixels), tiles_per_row=tiles_per_row))
-        return img_list
+        # Sanity check
+        if img_toks_flat.ndim == 2:
+            expected_n = grid_size_tensor[:, 0] * grid_size_tensor[:, 1]
+            assert torch.all(img_toks_flat.shape[1] == expected_n), \
+                f"Token count mismatch: {img_toks_flat.shape[1]} vs calculated {expected_n.tolist()}"
+
+        return img_toks_flat, grid_size_tensor
 
     @staticmethod
     def _pil_from_chw_tensor(chw_tensor: Tensor) -> List[Image.Image]:
-        normalized_tensor = torch.clamp(chw_tensor.cpu().detach(), -1.0, 1.0).add(1).div(2)
-        img_data = (normalized_tensor.permute(0, 2, 3, 1) * 255).to(torch.uint8)
-        return [Image.fromarray(img.numpy(), mode="RGB") for img in img_data]
+        """Converts batch of CHW tensors ([-1, 1]) to list of PIL Images."""
+        # Clamp, denormalize (from [-1, 1] to [0, 1]), scale to [0, 255], change layout, convert to numpy/PIL
+        normalized = torch.clamp(chw_tensor.detach().cpu(), -1.0, 1.0).add(1.0).div(2.0) # Range [0, 1]
+        hwc_byte = (normalized.permute(0, 2, 3, 1) * 255.0).to(torch.uint8).numpy()
+        return [Image.fromarray(img, mode="RGB") for img in hwc_byte]
+
+    @torch.no_grad()
+    def pil_from_img_toks(
+        self,
+        img_tensor: Tensor,
+        grid_size: Tensor
+    ) -> List[Image.Image]:
+        """
+        Decodes flat image tokens back to PIL Images, handling aspect ratio and cropping.
+
+        Args:
+            img_tensor (Tensor): Flattened image tokens (B, N).
+            grid_size (Tensor): Token grid dimensions for each image (B, 2), [h_tokens, w_tokens].
+
+        Returns:
+            List[Image.Image]: The reconstructed PIL images.
+        """
+        if not self._vq_model:
+            raise ValueError("VQModel must be provided during initialization to detokenize images.")
+
+        bz = img_tensor.shape[0]
+
+        pixels_list = []
+        for i in range(bz):
+            tokens_i = img_tensor[i]
+            h_tokens, w_tokens = grid_size[i].tolist()
+
+            num_tokens_expected = h_tokens * w_tokens
+            assert tokens_i.shape[0] == num_tokens_expected, \
+                f"Item {i}: Expected {num_tokens_expected} tokens, got {tokens_i.shape[0]}"
+
+            # lookup codebook
+            # The shape required by get_codebook_entry's permute is (B, H, W, C)
+            # We process one image at a time here, so B=1 conceptually for shape
+            shape_bhwc = (1, h_tokens, w_tokens, self._vq_model.quantize.e_dim)
+            # Unsqueeze tokens_i to add batch dim: (1, N)
+            codebook_entry = self._vq_model.quantize.get_codebook_entry(tokens_i.unsqueeze(0), shape=shape_bhwc)
+
+            # Decode
+            pixels = self._vq_model.decode(codebook_entry)
+            pixels_list.append(pixels)
+
+        # Stack results back into a batch and convert to PIL
+        final_pixels = torch.cat(pixels_list, dim=0)
+        return self._pil_from_chw_tensor(final_pixels)
+    

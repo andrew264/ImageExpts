@@ -31,7 +31,7 @@ loss_config = MappingProxyType(dict(
 
 class VQModel(L.LightningModule):
     # https://github.com/CompVis/taming-transformers/blob/master/taming/models/vqgan.py
-    def __init__(self, ddconfig=dd_config,  lossconfig: Optional[dict] = None, n_embed: int=8192, embed_dim: int=256, colorize_nlabels=None, monitor=None, grad_accum_steps: int=1):
+    def __init__(self, ddconfig=dd_config,  lossconfig: Optional[dict] = None, n_embed: int=8192, embed_dim: int=256, grad_accum_steps: int=1):
         super().__init__()
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
@@ -39,8 +39,6 @@ class VQModel(L.LightningModule):
         self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         self.learning_rate = 5e-4
-        if colorize_nlabels is not None: self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
-        self.monitor = monitor
         self.loss = VQLPIPSWithDiscriminator(**lossconfig) if lossconfig is not None else None
 
         self.automatic_optimization = False
