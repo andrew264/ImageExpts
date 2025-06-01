@@ -21,20 +21,20 @@ class AttnBlock(nn.Module):
 
         self.scale = in_channels ** -0.5
 
+    @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h_ = self.norm(x)
         q, k, v = self.q(h_), self.k(h_), self.v(h_)
 
         # Reshape and compute attention
         b, c, h, w = q.shape
-        q, k, v = [t.view(b, c, -1) for t in (q, k, v)]
-        q = q.permute(0, 2, 1)
+        q, k, v = map(lambda x: x.view(b, c, -1), (q, k, v))
 
-        attn = torch.bmm(q, k) * self.scale
+        attn = q.permute(0, 2, 1) @ k * self.scale
         attn = F.softmax(attn, dim=2)
 
         # Attend to values
-        h_ = torch.bmm(v, attn.permute(0, 2, 1))
+        h_ = v @ attn.permute(0, 2, 1)
         h_ = h_.view(b, c, h, w)
 
         return x + self.proj_out(h_)
@@ -56,6 +56,7 @@ class ResnetBlock(nn.Module):
 
         self.nin_shortcut = (nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0) if in_channels != out_channels else nn.Identity())
 
+    @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = x
         h = self.norm1(h)

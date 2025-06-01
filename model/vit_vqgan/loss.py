@@ -70,16 +70,18 @@ class NLayerDiscriminator(nn.Module):
 
 
 class VQLPIPSWithDiscriminator(nn.Module):
-    def __init__(self, disc_start, codebook_weight=1.0, pixelloss_weight=1.0,
-                 disc_num_layers=3, disc_in_channels=3, disc_factor=1.0, disc_weight=1.0,
-                 perceptual_weight=1.0, disc_conditional=False,
+    def __init__(self, disc_start: int, codebook_weight=0.0, pixelloss_weight=1.0,
+                 disc_num_layers=3, disc_in_channels=3, disc_factor=1., disc_weight=.1,
+                 perceptual_weight=0.1, disc_conditional=False,
                  disc_ndf=64, disc_loss="hinge"):
         super().__init__()
         assert disc_loss in ["hinge", "vanilla"]
         self.codebook_weight = codebook_weight
         self.pixel_weight = pixelloss_weight
-        self.perceptual_loss = LearnedPerceptualImagePatchSimilarity(net_type='vgg', reduction='mean', normalize=False).eval()
         self.perceptual_weight = perceptual_weight
+        if self.perceptual_weight > 0:
+            self.perceptual_loss = LearnedPerceptualImagePatchSimilarity(net_type='vgg', reduction='mean', normalize=False).eval()
+        else: self.perceptual_loss = None
 
         self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels, n_layers=disc_num_layers, ndf=disc_ndf).apply(weights_init)
         self.discriminator_iter_start = disc_start
@@ -111,9 +113,9 @@ class VQLPIPSWithDiscriminator(nn.Module):
 
     def forward(self, codebook_loss, inputs, reconstructions, optimizer_idx, global_step, last_layer=None, cond=None, split="train"):
         rec_loss = torch.abs(inputs.contiguous() - reconstructions.contiguous())
-        if self.perceptual_weight > 0:
+        if self.perceptual_weight > 0 and self.perceptual_loss is not None:
             # clamp tensors to -1 to 1
-            reconstructions = torch.clamp(reconstructions, -1.0, 1.0)
+            # reconstructions = torch.clamp(reconstructions, -1.0, 1.0)
             p_loss = self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
         else:
             p_loss = torch.tensor([0.0], device=inputs.device)
@@ -136,7 +138,7 @@ class VQLPIPSWithDiscriminator(nn.Module):
                 d_weight = self.calculate_adaptive_weight(nll_loss, g_loss, last_layer=last_layer)
             except RuntimeError:
                 assert not self.training
-                d_weight = torch.tensor(0.0)
+                d_weight = torch.tensor(0.0, device=inputs.device)
 
             disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
             loss = nll_loss + d_weight * disc_factor * g_loss + self.codebook_weight * codebook_loss.mean()

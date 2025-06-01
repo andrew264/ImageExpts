@@ -21,7 +21,7 @@ class ImageTokenizer:
     # https://github.com/facebookresearch/chameleon/blob/main/chameleon/inference/image_tokenizer.py
     def __init__(
         self,
-        model: VQModel = None,
+        model: Optional[VQModel] = None,
         device: str | torch.device | None = None,
         target_height: Optional[int] = None,
         target_width: Optional[int] = None,
@@ -32,7 +32,7 @@ class ImageTokenizer:
         self.target_height = target_height
         self.target_width = target_width
 
-        if model is not None:
+        if self._vq_model is not None:
             if not device:
                 devices = {p.device for p in self._vq_model.parameters()}
                 assert len(devices) == 1, "Model parameters must be on a single device"
@@ -45,8 +45,8 @@ class ImageTokenizer:
             assert len(dtypes) == 1, "Model parameters must have a single dtype"
             self._dtype = dtypes.pop()
 
-            if hasattr(model, 'encoder') and hasattr(model.encoder, 'ch_mult'):
-                num_downsamplings = len(model.encoder.ch_mult) - 1
+            if hasattr(self._vq_model, 'encoder') and hasattr(self._vq_model.encoder, 'ch_mult'):
+                num_downsamplings = len(self._vq_model.encoder.ch_mult) - 1
                 self.downsample_factor = 2 ** num_downsamplings
             else:
                 # Fallback or raise error if config structure changes
@@ -86,7 +86,7 @@ class ImageTokenizer:
 
         Returns:
             - Padded tensor ready for VQGAN.
-            - image size (h, w).
+            - image size (w, h).
         """
         img = self._whiten_transparency(img)
         w_orig, h_orig = img.size
@@ -98,30 +98,30 @@ class ImageTokenizer:
             h_new, w_new = self.target_height, self.target_width
         elif self.target_height or self.target_width:
             # Scale longest side to target, preserve aspect ratio
-            scale_h = (self.target_height / h_orig) if self.target_height else 1.0
             scale_w = (self.target_width / w_orig) if self.target_width else 1.0
-            scale = min(scale_h, scale_w) if self.target_height and self.target_width else max(scale_h, scale_w)
-            h_new = int(round(h_orig * scale))
+            scale_h = (self.target_height / h_orig) if self.target_height else 1.0
+            scale = min(scale_w, scale_h) if self.target_width and self.target_height else max(scale_w, scale_h)
             w_new = int(round(w_orig * scale))
+            h_new = int(round(h_orig * scale))
         else:
             # Use original size
-            h_new, w_new = h_orig, w_orig
+            w_new, h_new = w_orig, h_orig 
 
         # Ensure dimensions are at least the downsample factor
-        h_new = max(h_new, self.downsample_factor)
         w_new = max(w_new, self.downsample_factor)
+        h_new = max(h_new, self.downsample_factor)
 
         img_resized = img.resize((w_new, h_new), Image.Resampling.LANCZOS)
         w_unpadded, h_unpadded = img_resized.size # size *before* padding
 
         # --- Pad to multiple of downsample_factor ---
-        h_padded = _pad_to_multiple(h_unpadded, self.downsample_factor)
         w_padded = _pad_to_multiple(w_unpadded, self.downsample_factor)
+        h_padded = _pad_to_multiple(h_unpadded, self.downsample_factor)
 
-        pad_top = (h_padded - h_unpadded) // 2
-        pad_bottom = h_padded - h_unpadded - pad_top
         pad_left = (w_padded - w_unpadded) // 2
         pad_right = w_padded - w_unpadded - pad_left
+        pad_top = (h_padded - h_unpadded) // 2
+        pad_bottom = h_padded - h_unpadded - pad_top
 
         tensor_resized = self.to_tensor(img_resized) # Shape (C, H, W)
 
@@ -132,7 +132,7 @@ class ImageTokenizer:
         # Apply dtype conversion and normalization
         processed_tensor = self.normalize(self.to_dtype(padded_tensor))
 
-        return processed_tensor, (h_padded, w_padded)
+        return processed_tensor, (w_padded, h_padded)
 
 
     @torch.no_grad()
@@ -169,10 +169,10 @@ class ImageTokenizer:
 
         # Calculate grid sizes
         grid_sizes_list = []
-        for h_pad, w_pad in padded_sizes:
-            h_tokens = h_pad // self.downsample_factor
+        for w_pad, h_pad in padded_sizes:
             w_tokens = w_pad // self.downsample_factor
-            grid_sizes_list.append([h_tokens, w_tokens])
+            h_tokens = h_pad // self.downsample_factor
+            grid_sizes_list.append([w_tokens, h_tokens])
 
         grid_size_tensor = torch.tensor(grid_sizes_list, dtype=torch.long, device=img_toks_flat.device)
 
@@ -203,7 +203,7 @@ class ImageTokenizer:
 
         Args:
             img_tensor (Tensor): Flattened image tokens (B, N).
-            grid_size (Tensor): Token grid dimensions for each image (B, 2), [h_tokens, w_tokens].
+            grid_size (Tensor): Token grid dimensions for each image (B, 2), [w_tokens, h_tokens].
 
         Returns:
             List[Image.Image]: The reconstructed PIL images.
@@ -216,9 +216,9 @@ class ImageTokenizer:
         pixels_list = []
         for i in range(bz):
             tokens_i = img_tensor[i]
-            h_tokens, w_tokens = grid_size[i].tolist()
+            w_tokens, h_tokens = grid_size[i].tolist()
 
-            num_tokens_expected = h_tokens * w_tokens
+            num_tokens_expected = w_tokens * h_tokens
             assert tokens_i.shape[0] == num_tokens_expected, \
                 f"Item {i}: Expected {num_tokens_expected} tokens, got {tokens_i.shape[0]}"
 
