@@ -12,6 +12,9 @@ A model that learns to represent images into discrete tokens. Can be used for im
 ### 3. [Sigmoid Loss for Language Image Pre-Training (SigLIP)](model/siglip/siglip.py)
 A zero-shot image classification model with a better loss function. This allows further scaling up the batch size, while also performing better at smaller batch sizes.
 
+### 4. [ViT VQGAN](model/vit_vqgan/model.py)
+VQ GAN with a Vision Transformer for Encoder and Decoder. FSQ for Vector Quantization. This is a very rough impl (and it kainda works) that i had in my head; need to do more research. 
+
 ## What is the purpose of this repository?
 This is my playground for experimenting with images. I will be adding more models and experiments as I learn more about other architectures and techniques.
 The final goal is to add multimodality in [modelex](https://github.com/andrew264/modelex)
