@@ -1,7 +1,7 @@
 
 import lightning as L
 import torch
-from typing import Optional, Tuple
+from typing import Tuple
 from torch import Tensor
 
 from model.vit_vqgan.layers import Config
@@ -26,8 +26,8 @@ class ViTVQGAN(L.LightningModule):
         self.grad_accum_steps = grad_accum_steps
         self.automatic_optimization = False
 
-    def encode(self, pixels: Tensor, interpolate_pos_encoding: Optional[bool] = False) -> Tuple[Tensor, Tensor]:
-        x = self.encoder(pixels, interpolate_pos_encoding)
+    def encode(self, pixels: Tensor) -> Tuple[Tensor, Tensor]:
+        x = self.encoder(pixels)
         x, indices = self.quantize(x)
         return x, indices
 
@@ -35,8 +35,8 @@ class ViTVQGAN(L.LightningModule):
         hidden = self.quantize.indices_to_codes(indices)
         return self.decoder(hidden)
 
-    def forward(self, pixels: Tensor, interpolate_pos_encoding: Optional[bool] = False) -> Tuple[Tensor, Tensor]:
-        x = self.encoder(pixels, interpolate_pos_encoding)
+    def forward(self, pixels: Tensor) -> Tuple[Tensor, Tensor]:
+        x = self.encoder(pixels)
         x, indices = self.quantize(x)
         recon = self.decoder(x)
         return recon, indices

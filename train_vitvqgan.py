@@ -18,7 +18,7 @@ def count_params(model: nn.Module) -> float:
 
 def train(model: L.LightningModule, dataloader: DataLoader):
     checkpoint_callback = ModelCheckpoint(
-        dirpath="weights/vitvqgan", filename="weights", save_weights_only=True, every_n_train_steps=5000)
+        dirpath="weights/vitvqgan", filename="weights", save_weights_only=True, every_n_train_steps=1000)
     trainer = L.Trainer(max_epochs=1, precision="bf16-true",
                         callbacks=[checkpoint_callback])
     trainer.fit(model, dataloader)
@@ -32,7 +32,7 @@ def train(model: L.LightningModule, dataloader: DataLoader):
 if __name__ == '__main__':
     model = ViTVQGAN(config={
         "hidden_size": 768,
-        "image_size": 256,
+        "image_size": 512,
         "intermediate_size": 3072,
         "num_attention_heads": 12,
         "num_hidden_layers": 12,
@@ -42,10 +42,14 @@ if __name__ == '__main__':
         "layer_norm_eps": 1e-6,
         "levels": [8, 8, 5, 5],
         "num_codebooks": 8,
+        "rope_base": 10000,
     }).bfloat16()
     print(model)
+    path = "/home/andrew264/PycharmProjects/ImageExperiments/weights/vitvqgan/weights-v4.ckpt"
+    sd = torch.load(path, weights_only=True)['state_dict']
+    model.load_state_dict(sd, strict=False)
     print(count_params(model), 'M parameters')
-    ds = ZipImageDataset('/mnt/d/stickers/train.zip', 256, torch.bfloat16)
-    dataloader = DataLoader(ds, batch_size=16, num_workers=1, shuffle=True,)
+    ds = ZipImageDataset('/mnt/d/stickers/train.zip', 512, torch.bfloat16)
+    dataloader = DataLoader(ds, batch_size=8, num_workers=1, shuffle=True,)
 
     train(model, dataloader)

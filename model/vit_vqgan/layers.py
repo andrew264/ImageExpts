@@ -1,10 +1,11 @@
 from functools import partial
-from typing import TypedDict, Optional
+from typing import Tuple, TypedDict, Optional
 
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from einops.layers.torch import Rearrange
+from torch.utils.checkpoint import checkpoint
 
 
 class Config(TypedDict):
@@ -19,6 +20,7 @@ class Config(TypedDict):
     layer_norm_eps: float
     levels: list[int]
     num_codebooks: int
+    rope_base: int
 
 class VisionEmbeddings(nn.Module):
     def __init__(self, config: Config):
@@ -38,47 +40,46 @@ class VisionEmbeddings(nn.Module):
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
-        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-        self.register_buffer("position_ids", torch.arange(self.num_positions).expand((1, -1)), persistent=False)
 
-    def interpolate_pos_encoding(self, embeddings: Tensor, height: int, width: int) -> Tensor:
-        """
-        This method allows to interpolate the pre-trained position encodings, to be able to use the model on higher resolution images.
-        """
-
-        num_patches = embeddings.shape[1]
-        num_positions = self.position_embedding.weight.shape[0]
-
-        if num_patches == num_positions and height == width:
-            return self.position_embedding(self.position_ids)
-
-        patch_pos_embed = self.position_embedding.weight.unsqueeze(0)
-
-        dim = embeddings.shape[-1]
-
-        new_height = height // self.patch_size
-        new_width = width // self.patch_size
-
-        sqrt_num_positions = int(num_positions**0.5)
-        patch_pos_embed = patch_pos_embed.reshape(1, sqrt_num_positions, sqrt_num_positions, dim)
-        patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
-
-        patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_height, new_width), mode="bicubic", align_corners=False,)
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return patch_pos_embed
-
-    def forward(self, pixel_values: Tensor, interpolate_pos_encoding=False) -> Tensor:
-        _, _, height, width = pixel_values.shape
+    def forward(self, pixel_values: Tensor) -> Tensor:
         target_dtype = self.patch_embedding.weight.dtype
         patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
-
-        if interpolate_pos_encoding:
-            embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
-        else:
-            embeddings = embeddings + self.position_embedding(self.position_ids)
         return embeddings
 
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.dim = cfg['hidden_size'] // cfg['num_attention_heads']
+        self.base = cfg['rope_base']
+        self.inv_freq: Tensor
+        self.rope_init()
+
+    def rope_init(self):
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    def forward(self, position_ids: Tensor, dtype: torch.dtype = torch.bfloat16) -> Tuple[Tensor, Tensor]:
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = position_ids.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+
+def rotate_half(x: Tensor) -> Tensor:
+    return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+
+def apply_rotary_pos_emb(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, unsqueeze_dim: int = 1) -> Tuple[Tensor, Tensor]:
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 class Attention(nn.Module):
     def __init__(self, config: Config):
@@ -98,16 +99,18 @@ class Attention(nn.Module):
         self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
-    def forward(self, hidden_states: Tensor, attention_mask: Optional[Tensor] = None,) -> Tensor:
-        batch_size, q_len, _ = hidden_states.size()
+    def forward(self, hidden: Tensor, freqs: Optional[Tuple[Tensor, Tensor]] = None, attention_mask: Optional[Tensor] = None,) -> Tensor:
+        batch_size, q_len, _ = hidden.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states = self.q_proj(hidden)
+        key_states = self.k_proj(hidden)
+        value_states = self.v_proj(hidden)
 
         query_states = query_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if freqs is not None:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, *freqs)
 
         if query_states.device.type == "cuda" and attention_mask is not None:
             query_states = query_states.contiguous()
@@ -132,11 +135,11 @@ class MLP(nn.Module):
         self.fc1 = nn.Linear(config['hidden_size'], config['intermediate_size'])
         self.fc2 = nn.Linear(config['intermediate_size'], config['hidden_size'])
 
-    def forward(self, hidden_states: Tensor) -> Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
-        return hidden_states
+    def forward(self, hidden: Tensor) -> Tensor:
+        hidden = self.fc1(hidden)
+        hidden = self.activation_fn(hidden)
+        hidden = self.fc2(hidden)
+        return hidden
     
 class Block(nn.Module):
     def __init__(self, config: Config):
@@ -147,19 +150,19 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config['layer_norm_eps'])
 
-    def forward(self, hidden_states: Tensor, attention_mask: Tensor,) -> Tensor:
-        residual = hidden_states
+    def forward(self, hidden: Tensor, freqs: Optional[Tuple[Tensor, Tensor]], attention_mask: Tensor,) -> Tensor:
+        residual = hidden
 
-        hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states=hidden_states, attention_mask=attention_mask,)
-        hidden_states = residual + hidden_states
+        hidden = self.layer_norm1(hidden)
+        hidden = self.self_attn(hidden=hidden, freqs=freqs, attention_mask=attention_mask,)
+        hidden = residual + hidden
 
-        residual = hidden_states
-        hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        residual = hidden
+        hidden = self.layer_norm2(hidden)
+        hidden = self.mlp(hidden)
+        hidden = residual + hidden
 
-        return hidden_states
+        return hidden
     
 class Transformer(nn.Module):
     def __init__(self, config: Config):
@@ -167,11 +170,11 @@ class Transformer(nn.Module):
         self.config = config
         self.layers = nn.ModuleList([Block(config) for _ in range(config['num_hidden_layers'])])
 
-    def forward(self, inputs_embeds, attention_mask: Optional[Tensor] = None) -> Tensor:
-        hidden_states = inputs_embeds
+    def forward(self, inputs_embeds, freqs: Optional[Tuple[Tensor, Tensor]] = None, attention_mask: Optional[Tensor] = None) -> Tensor:
+        hidden = inputs_embeds
         for encoder_layer in self.layers:
-            hidden_states = encoder_layer(hidden_states, attention_mask)
-        return hidden_states
+            hidden = checkpoint(encoder_layer, hidden, freqs, attention_mask, use_reentrant=False)
+        return hidden
 
     
 class ViTEncoder(nn.Module):
@@ -183,11 +186,13 @@ class ViTEncoder(nn.Module):
         self.embeddings = VisionEmbeddings(config)
         self.encoder = Transformer(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config['layer_norm_eps'])
+        self.rotary_emb = RotaryEmbedding(config)
 
-    def forward(self, pixel_values, interpolate_pos_encoding: Optional[bool] = False) -> Tensor:
-        hidden_states = self.embeddings(pixel_values, interpolate_pos_encoding=interpolate_pos_encoding)
-
-        last_hidden_state = self.encoder(inputs_embeds=hidden_states,)
+    def forward(self, pixel_values) -> Tensor:
+        hidden = self.embeddings(pixel_values)
+        input_pos = torch.arange(hidden.shape[1], device=hidden.device).unsqueeze(0)
+        freqs = self.rotary_emb(input_pos)
+        last_hidden_state = self.encoder(inputs_embeds=hidden, freqs=freqs)
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
         return last_hidden_state
