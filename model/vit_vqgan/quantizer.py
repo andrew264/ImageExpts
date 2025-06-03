@@ -32,6 +32,7 @@ class FSQ(Module):
         self,
         levels: list[int],
         dim: int | None = None,
+        output_dim: int | None = None,
         num_codebooks = 1,
         keep_num_codebooks_dim: bool | None = None,
         scale: float | None = None,
@@ -68,21 +69,23 @@ class FSQ(Module):
         self.keep_num_codebooks_dim = keep_num_codebooks_dim
 
         self.dim = default(dim, len(_levels) * num_codebooks)
+        
+        _actual_output_dim = default(output_dim, self.dim)
 
         self.channel_first = channel_first
 
-        has_projections = self.dim != effective_codebook_dim
-        self.project_in = nn.Linear(self.dim, effective_codebook_dim, bias = projection_has_bias) if has_projections else nn.Identity()
-        self.project_out = nn.Linear(effective_codebook_dim, self.dim, bias = projection_has_bias) if has_projections else nn.Identity()
-
-        self.has_projections = has_projections
+        has_input_projection = self.dim != effective_codebook_dim
+        self.project_in = nn.Linear(self.dim, effective_codebook_dim, bias = projection_has_bias) if has_input_projection else nn.Identity()
+        
+        has_output_projection = _actual_output_dim != effective_codebook_dim
+        self.project_out = nn.Linear(effective_codebook_dim, _actual_output_dim, bias = projection_has_bias) if has_output_projection else nn.Identity()
 
         self.return_indices = return_indices
 
         if self.return_indices:
             self.codebook_size = self._levels.prod().item()
-            implicit_codebook = self._indices_to_codes(torch.arange(self.codebook_size))
-            self.register_buffer('implicit_codebook', implicit_codebook, persistent = False)
+            implicit_codebook_normalized = self._indices_to_codes(torch.arange(self.codebook_size))
+            self.register_buffer('implicit_codebook', implicit_codebook_normalized, persistent = False)
 
         self.allowed_dtypes = allowed_dtypes
         self.force_quantization_f32 = force_quantization_f32

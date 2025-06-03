@@ -6,6 +6,7 @@ import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
 
 from dataset.zipimage import ZipImageDataset
+from model.vit_vqgan.config import ViTVQGANConfig
 from model.vit_vqgan.model import ViTVQGAN
 
 torch.set_float32_matmul_precision('medium')
@@ -30,22 +31,9 @@ def train(model: L.LightningModule, dataloader: DataLoader):
 
 
 if __name__ == '__main__':
-    model = ViTVQGAN(config={
-        "hidden_size": 768,
-        "image_size": 512,
-        "intermediate_size": 3072,
-        "num_attention_heads": 12,
-        "num_hidden_layers": 12,
-        "patch_size": 16,
-        "num_channels": 4,
-        "attention_dropout": 0.0,
-        "layer_norm_eps": 1e-6,
-        "levels": [8, 8, 5, 5],
-        "num_codebooks": 8,
-        "rope_base": 10000,
-    }).bfloat16()
+    model = ViTVQGAN(config=ViTVQGANConfig()).bfloat16()
     print(model)
-    path = "/home/andrew264/PycharmProjects/ImageExperiments/weights/vitvqgan/weights-v4.ckpt"
+    path = "/home/andrew264/PycharmProjects/ImageExperiments/weights/vitvqgan/weights-v6.ckpt"
     sd = torch.load(path, weights_only=True)['state_dict']
     model.load_state_dict(sd, strict=False)
     print(count_params(model), 'M parameters')

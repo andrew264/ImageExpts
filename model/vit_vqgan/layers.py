@@ -1,62 +1,54 @@
 from functools import partial
-from typing import Tuple, TypedDict, Optional
+from typing import Tuple, Optional
 
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from einops.layers.torch import Rearrange
+from einops import rearrange
 from torch.utils.checkpoint import checkpoint
 
+from model.vit_vqgan.config import BaseTransformerConfig, DecoderTransformerConfig, EncoderTransformerConfig
 
-class Config(TypedDict):
-    hidden_size: int
-    image_size: int
-    intermediate_size: int
-    num_attention_heads: int
-    num_hidden_layers: int
-    patch_size: int
-    num_channels: int
-    attention_dropout: float
-    layer_norm_eps: float
-    levels: list[int]
-    num_codebooks: int
-    rope_base: int
 
 class VisionEmbeddings(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, patch_size: int, num_channels: int, embed_dim: int):
         super().__init__()
-        self.config = config
-        self.embed_dim = config['hidden_size']
-        self.image_size = config['image_size']
-        self.patch_size = config['patch_size']
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
 
         self.patch_embedding = nn.Conv2d(
-            in_channels=config['num_channels'],
+            in_channels=num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
             padding="valid",
         )
 
-        self.num_patches = (self.image_size // self.patch_size) ** 2
-        self.num_positions = self.num_patches
-
-    def forward(self, pixel_values: Tensor) -> Tensor:
+    def forward(self, pixel_values: Tensor) -> Tuple[Tensor, Tuple[int, int]]:
         target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))  # shape = [*, width, grid, grid]
+        
+        _, _, H, W = pixel_values.shape
+        if H % self.patch_size != 0 or W % self.patch_size != 0:
+            raise ValueError(
+                f"Input image dimensions ({H}x{W}) are not divisible by patch size ({self.patch_size})."
+            )
+        grid_h = H // self.patch_size
+        grid_w = W // self.patch_size
+        
+        patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
-        return embeddings
+        return embeddings, (grid_h, grid_w)
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, cfg: Config):
+    def __init__(self, config: EncoderTransformerConfig):
         super().__init__()
-        self.dim = cfg['hidden_size'] // cfg['num_attention_heads']
-        self.base = cfg['rope_base']
+        self.dim = config.hidden_size // config.num_attention_heads
+        self.base = config.rope_base
         self.inv_freq: Tensor
-        self.rope_init()
+        self._init_rope()
 
-    def rope_init(self):
+    def _init_rope(self):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -82,17 +74,16 @@ def apply_rotary_pos_emb(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor, unsquee
     return q_embed, k_embed
 
 class Attention(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config: BaseTransformerConfig):
         super().__init__()
-        self.config = config
-        self.embed_dim = config['hidden_size']
-        self.num_heads = config['num_attention_heads']
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:" f" {self.num_heads}).")
         
         self.scale = self.head_dim**-0.5
-        self.dropout = config['attention_dropout']
+        self.dropout = config.attention_dropout
 
         self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
@@ -109,6 +100,7 @@ class Attention(nn.Module):
         query_states = query_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
         if freqs is not None:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, *freqs)
 
@@ -122,18 +114,15 @@ class Attention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, q_len, self.embed_dim)
-
         attn_output = self.out_proj(attn_output)
-
         return attn_output
     
 class MLP(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config: BaseTransformerConfig):
         super().__init__()
-        self.config = config
         self.activation_fn = partial(F.gelu, approximate="tanh")
-        self.fc1 = nn.Linear(config['hidden_size'], config['intermediate_size'])
-        self.fc2 = nn.Linear(config['intermediate_size'], config['hidden_size'])
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
     def forward(self, hidden: Tensor) -> Tensor:
         hidden = self.fc1(hidden)
@@ -142,77 +131,80 @@ class MLP(nn.Module):
         return hidden
     
 class Block(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config: BaseTransformerConfig):
         super().__init__()
-        self.embed_dim = config['hidden_size']
+        self.embed_dim = config.hidden_size
         self.self_attn = Attention(config=config)
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config['layer_norm_eps'])
+        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = MLP(config)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config['layer_norm_eps'])
+        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
-    def forward(self, hidden: Tensor, freqs: Optional[Tuple[Tensor, Tensor]], attention_mask: Tensor,) -> Tensor:
+    def forward(self, hidden: Tensor, freqs: Optional[Tuple[Tensor, Tensor]], attention_mask: Optional[Tensor]) -> Tensor:
         residual = hidden
-
         hidden = self.layer_norm1(hidden)
-        hidden = self.self_attn(hidden=hidden, freqs=freqs, attention_mask=attention_mask,)
+        hidden = self.self_attn(hidden=hidden, freqs=freqs, attention_mask=attention_mask)
         hidden = residual + hidden
 
         residual = hidden
         hidden = self.layer_norm2(hidden)
         hidden = self.mlp(hidden)
         hidden = residual + hidden
-
         return hidden
     
 class Transformer(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config: BaseTransformerConfig):
         super().__init__()
-        self.config = config
-        self.layers = nn.ModuleList([Block(config) for _ in range(config['num_hidden_layers'])])
+        self.layers = nn.ModuleList([Block(config) for _ in range(config.num_hidden_layers)])
 
-    def forward(self, inputs_embeds, freqs: Optional[Tuple[Tensor, Tensor]] = None, attention_mask: Optional[Tensor] = None) -> Tensor:
-        hidden = inputs_embeds
+    def forward(self, inputs_embeds: Tensor, freqs: Optional[Tuple[Tensor, Tensor]] = None, attention_mask: Optional[Tensor] = None) -> Tensor:
+        hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            hidden = checkpoint(encoder_layer, hidden, freqs, attention_mask, use_reentrant=False)
-        return hidden
+            hidden_states = checkpoint(encoder_layer, hidden_states, freqs, attention_mask, use_reentrant=False)
+        return hidden_states
 
-    
 class ViTEncoder(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, encoder_config: EncoderTransformerConfig, patch_size: int, num_channels: int):
         super().__init__()
-        self.config = config
-        embed_dim = config['hidden_size']
+        self.embeddings = VisionEmbeddings(patch_size, num_channels, encoder_config.hidden_size)
+        self.encoder = Transformer(encoder_config)
+        self.post_layernorm = nn.LayerNorm(encoder_config.hidden_size, eps=encoder_config.layer_norm_eps)
+        self.rotary_emb = RotaryEmbedding(encoder_config)
 
-        self.embeddings = VisionEmbeddings(config)
-        self.encoder = Transformer(config)
-        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config['layer_norm_eps'])
-        self.rotary_emb = RotaryEmbedding(config)
-
-    def forward(self, pixel_values) -> Tensor:
-        hidden = self.embeddings(pixel_values)
-        input_pos = torch.arange(hidden.shape[1], device=hidden.device).unsqueeze(0)
-        freqs = self.rotary_emb(input_pos)
-        last_hidden_state = self.encoder(inputs_embeds=hidden, freqs=freqs)
-        last_hidden_state = self.post_layernorm(last_hidden_state)
-
-        return last_hidden_state
+    def forward(self, pixel_values: Tensor) -> Tuple[Tensor, Tuple[int, int]]:
+        hidden_states, grid_hw = self.embeddings(pixel_values)
+        
+        num_patches = hidden_states.shape[1]
+        position_ids = torch.arange(num_patches, device=hidden_states.device).unsqueeze(0)
+        freqs = self.rotary_emb(position_ids, dtype=hidden_states.dtype)
+        
+        encoder_outputs = self.encoder(inputs_embeds=hidden_states, freqs=freqs)
+        last_hidden_state = self.post_layernorm(encoder_outputs)
+        return last_hidden_state, grid_hw
 
 class ViTDecoder(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, decoder_config: DecoderTransformerConfig, patch_size: int, num_channels: int):
         super().__init__()
-        self.config = config
-        embed_dim = config['hidden_size']
-        self.decoder = Transformer(config)
-        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config['layer_norm_eps'])
-        self.to_pixel = nn.Sequential(
-            Rearrange('b (h w) c -> b c h w', h=config['image_size'] // config['patch_size']),
-            nn.ConvTranspose2d(embed_dim, config['num_channels'], kernel_size=config['patch_size'], stride=config['patch_size'])
+        self.decoder_hidden_size = decoder_config.hidden_size
+            
+        self.decoder = Transformer(decoder_config)
+        self.post_layernorm = nn.LayerNorm(self.decoder_hidden_size, eps=decoder_config.layer_norm_eps)
+        
+        self.final_conv = nn.ConvTranspose2d(
+            self.decoder_hidden_size, 
+            num_channels, 
+            kernel_size=patch_size, 
+            stride=patch_size
         )
     
-    def forward(self, hidden: Tensor) -> Tensor:
-        x = self.post_layernorm(self.decoder(hidden))
-        return F.tanh(self.to_pixel(x))
-    
+    def forward(self, hidden_states: Tensor, grid_hw: Tuple[int, int]) -> Tensor:
+        grid_h, grid_w = grid_hw
+        
+        decoder_outputs = self.decoder(hidden_states, freqs=None)
+        x = self.post_layernorm(decoder_outputs)
+        
+        x = rearrange(x, 'b (h w) c -> b c h w', h=grid_h, w=grid_w)
+        
+        return F.tanh(self.final_conv(x))
 
     def get_last_layer(self) -> nn.Parameter:
-        return self.to_pixel[-1].weight
+        return self.final_conv.weight
